@@ -9,6 +9,8 @@ import json
 import re
 import html
 import functools
+import shutil
+import atexit
 from datetime import datetime
 import os
 import csv
@@ -330,14 +332,84 @@ def ensure_parent_dir(file_path):
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
 
-def get_db():
-    ensure_parent_dir(DB_PATH)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+def _is_sqlite_corruption_error(exc):
+    text = str(exc).lower()
+    return (
+        "database disk image is malformed" in text
+        or "disk i/o error" in text
+        or "file is not a database" in text
+    )
+
+def _close_thread_db():
+    conn = getattr(DB_LOCAL, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        DB_LOCAL.conn = None
+
+def _backup_broken_db(reason="corrupt"):
+    try:
+        if not DB_PATH or not os.path.exists(DB_PATH):
+            return ""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = f"{DB_PATH}.{reason}.{stamp}.bak"
+        shutil.copy2(DB_PATH, backup_path)
+        for suffix in ("-wal", "-shm"):
+            sidecar = DB_PATH + suffix
+            if os.path.exists(sidecar):
+                shutil.copy2(sidecar, backup_path + suffix)
+        print(f"SQLite backup created before recovery: {backup_path}")
+        return backup_path
+    except Exception as e:
+        print(f"SQLite backup failed: {e}")
+        return ""
+
+def _remove_db_files():
+    for path in (DB_PATH, DB_PATH + "-wal", DB_PATH + "-shm"):
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print(f"Could not remove {path}: {e}")
+
+def _configure_sqlite(conn):
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+def get_db():
+    ensure_parent_dir(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30, isolation_level=None)
+    return _configure_sqlite(conn)
+
+def _quick_integrity_check():
+    if not DB_PATH or not os.path.exists(DB_PATH):
+        return True
+    try:
+        conn = get_db()
+        row = conn.execute("PRAGMA quick_check").fetchone()
+        conn.close()
+        return bool(row and str(row[0]).lower() == "ok")
+    except Exception as e:
+        print(f"SQLite integrity check failed: {e}")
+        return False
+
+def repair_or_reset_database_if_needed():
+    if _quick_integrity_check():
+        return
+    _close_thread_db()
+    backup_path = _backup_broken_db("corrupt")
+    _remove_db_files()
+    print(f"SQLite database was corrupt / unreadable. Recreated clean DB. Old copy: {backup_path or 'backup failed'}")
+
 def init_db():
+    repair_or_reset_database_if_needed()
     conn = get_db()
     c = conn.cursor()
     c.executescript("""
@@ -620,51 +692,76 @@ init_db()
 
 def get_fast_db():
     """Thread-local SQLite connection for frequent small queries.
-    This avoids reopening SQLite on every message/callback and keeps all features intact.
+    Keeps the bot fast while avoiding cross-thread SQLite connection reuse.
     """
     conn = getattr(DB_LOCAL, "conn", None)
     if conn is None:
-        ensure_parent_dir(DB_PATH)
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA foreign_keys=ON")
+        conn = get_db()
         DB_LOCAL.conn = conn
     return conn
 
+def _execute_once(query, params=(), fetch=False, fetchone=False):
+    conn = get_fast_db()
+    c = conn.cursor()
+    c.execute(query, params)
+    result = None
+    if fetchone:
+        result = c.fetchone()
+    elif fetch:
+        result = c.fetchall()
+    if not fetch and not fetchone:
+        conn.commit()
+    return result
+
 def db_execute(query, params=(), fetch=False, fetchone=False):
     with DB_LOCK:
-        conn = get_fast_db()
-        try:
-            c = conn.cursor()
-            c.execute(query, params)
-            result = None
-            if fetchone:
-                result = c.fetchone()
-            elif fetch:
-                result = c.fetchall()
-            conn.commit()
-            return result
-        except Exception as e:
-            conn.rollback()
-            print(f"DB Error: {e} | Query: {query} | Params: {params}")
-            return None
+        for attempt in range(2):
+            try:
+                return _execute_once(query, params, fetch=fetch, fetchone=fetchone)
+            except Exception as e:
+                try:
+                    conn = getattr(DB_LOCAL, "conn", None)
+                    if conn is not None:
+                        conn.rollback()
+                except Exception:
+                    pass
+                print(f"DB Error: {e} | Query: {query} | Params: {params}")
+                _close_thread_db()
+                if _is_sqlite_corruption_error(e):
+                    repair_or_reset_database_if_needed()
+                    if attempt == 0:
+                        continue
+                break
+        return None
 
 def db_lastrowid(query, params=()):
     with DB_LOCK:
-        conn = get_fast_db()
-        try:
-            c = conn.cursor()
-            c.execute(query, params)
-            last_id = c.lastrowid
-            conn.commit()
-            return last_id
-        except Exception as e:
-            conn.rollback()
-            print(f"DB Error: {e} | Query: {query} | Params: {params}")
-            return None
+        for attempt in range(2):
+            try:
+                conn = get_fast_db()
+                c = conn.cursor()
+                c.execute(query, params)
+                last_id = c.lastrowid
+                conn.commit()
+                clear_settings_cache()
+                return last_id
+            except Exception as e:
+                try:
+                    conn = getattr(DB_LOCAL, "conn", None)
+                    if conn is not None:
+                        conn.rollback()
+                except Exception:
+                    pass
+                print(f"DB Error: {e} | Query: {query} | Params: {params}")
+                _close_thread_db()
+                if _is_sqlite_corruption_error(e):
+                    repair_or_reset_database_if_needed()
+                    if attempt == 0:
+                        continue
+                break
+        return None
+
+atexit.register(_close_thread_db)
 
 def clear_settings_cache(key=None):
     with SETTINGS_CACHE_LOCK:
@@ -734,6 +831,8 @@ def can_user_access_withdraw(user):
     return True, ""
 
 def get_user(user_id):
+    if not user_id:
+        return None
     return db_execute("SELECT * FROM users WHERE user_id=?", (user_id,), fetchone=True)
 
 def get_all_users():
@@ -1033,14 +1132,27 @@ def get_referral_reward_label():
 
 
 def update_user(user_id, **kwargs):
-    if not kwargs:
+    if not kwargs or not user_id:
         return
-    sets = ", ".join([f"{k}=?" for k in kwargs])
-    vals = list(kwargs.values()) + [user_id]
+    allowed = {
+        "username", "first_name", "balance", "total_earned", "total_withdrawn",
+        "referral_count", "referred_by", "upi_id", "banned", "joined_at",
+        "last_daily", "is_premium", "referral_paid", "ip_address", "ip_verified",
+        "welcome_bonus_paid", "bonus_balance", "last_active_at",
+        "total_referral_earnings", "multi_account_warned", "force_join_left_notified",
+        "latest_join_msg_id", "latest_verify_msg_id", "latest_welcome_msg_id",
+    }
+    safe_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+    if not safe_kwargs:
+        return
+    sets = ", ".join([f"{k}=?" for k in safe_kwargs])
+    vals = list(safe_kwargs.values()) + [user_id]
     db_execute(f"UPDATE users SET {sets} WHERE user_id=?", tuple(vals))
 
 
 def mark_user_active(user_id):
+    if not get_user(user_id):
+        create_user(user_id, "", "User", 0)
     update_user(user_id, last_active_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 

@@ -202,6 +202,13 @@ def universal_handler(message):
         clear_state(user_id)
         set_state(user_id, "enter_amount", {"upi_id": text})
         user = get_user(user_id)
+        if not user:
+            create_user(user_id, getattr(message.from_user, "username", "") or "", getattr(message.from_user, "first_name", "User") or "User", 0)
+            user = get_user(user_id)
+        if not user:
+            clear_state(user_id)
+            safe_send(message.chat.id, f"{pe('warning')} Database is recovering. Please press /start and try again.")
+            return
         min_w = get_setting("min_withdraw")
         max_w = get_setting("max_withdraw_per_day")
         safe_send(
@@ -229,6 +236,10 @@ def universal_handler(message):
             safe_send(message.chat.id, f"{pe('cross')} Enter a valid number!")
             return
         user = get_user(user_id)
+        if not user:
+            clear_state(user_id)
+            safe_send(message.chat.id, f"{pe('warning')} Database is recovering. Please press /start and try again.")
+            return
         min_w = get_setting("min_withdraw")
         max_w = get_setting("max_withdraw_per_day")
         if amount < min_w:
@@ -268,7 +279,11 @@ def universal_handler(message):
         code = text.upper()
         clear_state(user_id)
         min_refs_redeem = int(get_setting("referral_min_activity_for_redeem") or 0)
-        if int(get_user(user_id)["referral_count"] or 0) < min_refs_redeem:
+        redeem_user = get_user(user_id)
+        if not redeem_user:
+            safe_send(message.chat.id, f"{pe('warning')} Database is recovering. Please press /start and try again.")
+            return
+        if int(redeem_user["referral_count"] or 0) < min_refs_redeem:
             safe_send(message.chat.id, f"{pe('cross')} Need at least {min_refs_redeem} referrals to claim redeem code.")
             return
         gift = db_execute("SELECT * FROM gift_codes WHERE code=? AND is_active=1", (code,), fetchone=True)
@@ -286,6 +301,9 @@ def universal_handler(message):
         amount = gift["amount"]
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user = get_user(user_id)
+        if not user:
+            safe_send(message.chat.id, f"{pe('warning')} Database is recovering. Please press /start and try again.")
+            return
         update_user(user_id, balance=user["balance"] + amount, total_earned=user["total_earned"] + amount)
         db_execute("UPDATE gift_codes SET total_claims=total_claims+1, claimed_by=?, claimed_at=? WHERE code=?", (user_id, now, code))
         db_execute("INSERT INTO gift_claims (code, user_id, claimed_at) VALUES (?,?,?)", (code, user_id, now))
@@ -308,6 +326,10 @@ def universal_handler(message):
             safe_send(message.chat.id, f"{pe('cross')} Enter a valid number!")
             return
         user = get_user(user_id)
+        if not user:
+            clear_state(user_id)
+            safe_send(message.chat.id, f"{pe('warning')} Database is recovering. Please press /start and try again.")
+            return
         min_gift = get_setting("min_gift_amount")
         max_gift = get_setting("max_gift_create")
         if amount < min_gift:

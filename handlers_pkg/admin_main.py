@@ -21,41 +21,51 @@ def admin_dashboard(message):
     show_dashboard(message.chat.id)
 
 
+def _row_value(row, key, default=0):
+    try:
+        if row is None:
+            return default
+        value = row[key]
+        return default if value is None else value
+    except Exception:
+        return default
+
+
 def show_dashboard(chat_id):
     total_users = get_user_count()
     total_withdrawn = get_total_withdrawn()
     total_refs = get_total_referrals()
     pending = get_total_pending()
     today = datetime.now().strftime("%Y-%m-%d")
-    banned = db_execute("SELECT COUNT(*) as cnt FROM users WHERE banned=1", fetchone=True)
-    total_bal = db_execute("SELECT SUM(balance) as t FROM users", fetchone=True)
+    banned = db_execute("SELECT COUNT(*) as cnt FROM users WHERE banned=1", fetchone=True) or {"cnt": 0}
+    total_bal = db_execute("SELECT SUM(balance) as t FROM users", fetchone=True) or {"t": 0}
     today_users = db_execute(
         "SELECT COUNT(*) as cnt FROM users WHERE joined_at LIKE ?",
         (f"{today}%",), fetchone=True
-    )
+    ) or {"cnt": 0}
     today_wd = db_execute(
         "SELECT COUNT(*) as cnt, SUM(amount) as t FROM withdrawals "
         "WHERE status='approved' AND processed_at LIKE ?",
         (f"{today}%",), fetchone=True
-    )
+    ) or {"cnt": 0, "t": 0}
     active_gifts = db_execute(
         "SELECT COUNT(*) as cnt FROM gift_codes WHERE is_active=1", fetchone=True
-    )
+    ) or {"cnt": 0}
     active_tasks = db_execute(
         "SELECT COUNT(*) as cnt FROM tasks WHERE status='active'", fetchone=True
-    )
+    ) or {"cnt": 0}
     pending_task_subs = db_execute(
         "SELECT COUNT(*) as cnt FROM task_submissions WHERE status='pending'", fetchone=True
-    )
+    ) or {"cnt": 0}
     total_task_comp = db_execute(
         "SELECT COUNT(*) as cnt FROM task_completions", fetchone=True
-    )
+    ) or {"cnt": 0}
     total_task_paid = db_execute(
         "SELECT SUM(reward_paid) as t FROM task_completions", fetchone=True
-    )
+    ) or {"t": 0}
     total_admins = db_execute(
         "SELECT COUNT(*) as cnt FROM admins WHERE is_active=1", fetchone=True
-    )
+    ) or {"cnt": 0}
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("🔄 Refresh", callback_data="dash_refresh"),
@@ -71,7 +81,7 @@ def show_dashboard(chat_id):
     )
     markup.add(
         types.InlineKeyboardButton(
-            f"📋 Task Subs ({pending_task_subs['cnt']})",
+            f"📋 Task Subs ({_row_value(pending_task_subs, 'cnt')})",
             callback_data="admin_task_pending_subs"
         ),
         types.InlineKeyboardButton("📜 Admin Logs", callback_data="view_admin_logs"),
@@ -81,21 +91,21 @@ def show_dashboard(chat_id):
         f"{pe('chart')} <b>Admin Dashboard</b> {pe('crown')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{pe('thumbs_up')} <b>Total Users:</b> {total_users}\n"
-        f"{pe('new_tag')} <b>Today's Joins:</b> {today_users['cnt']}\n"
-        f"{pe('no_entry')} <b>Banned:</b> {banned['cnt']}\n"
-        f"{pe('admin')} <b>Total Admins:</b> {total_admins['cnt']}\n\n"
+        f"{pe('new_tag')} <b>Today's Joins:</b> {_row_value(today_users, 'cnt')}\n"
+        f"{pe('no_entry')} <b>Banned:</b> {_row_value(banned, 'cnt')}\n"
+        f"{pe('admin')} <b>Total Admins:</b> {_row_value(total_admins, 'cnt')}\n\n"
         f"{pe('chart_up')} <b>Total Referrals:</b> {total_refs}\n"
-        f"{pe('fly_money')} <b>All Users Balance:</b> ₹{total_bal['t'] or 0:.2f}\n\n"
+        f"{pe('fly_money')} <b>All Users Balance:</b> ₹{_row_value(total_bal, 't'):.2f}\n\n"
         f"{pe('check')} <b>Total Withdrawn:</b> ₹{total_withdrawn:.2f}\n"
         f"{pe('hourglass')} <b>Pending WDs:</b> {pending}\n"
-        f"{pe('calendar')} <b>Today Approved:</b> {today_wd['cnt']} "
-        f"(₹{today_wd['t'] or 0:.2f})\n\n"
-        f"{pe('party')} <b>Active Gift Codes:</b> {active_gifts['cnt']}\n\n"
+        f"{pe('calendar')} <b>Today Approved:</b> {_row_value(today_wd, 'cnt')} "
+        f"(₹{_row_value(today_wd, 't'):.2f})\n\n"
+        f"{pe('party')} <b>Active Gift Codes:</b> {_row_value(active_gifts, 'cnt')}\n\n"
         f"{pe('rocket')} <b>═══ Task Stats ═══</b>\n"
-        f"{pe('active')} <b>Active Tasks:</b> {active_tasks['cnt']}\n"
-        f"{pe('pending2')} <b>Pending Submissions:</b> {pending_task_subs['cnt']}\n"
-        f"{pe('trophy')} <b>Total Completions:</b> {total_task_comp['cnt']}\n"
-        f"{pe('coins')} <b>Total Task Paid:</b> ₹{total_task_paid['t'] or 0:.2f}\n"
+        f"{pe('active')} <b>Active Tasks:</b> {_row_value(active_tasks, 'cnt')}\n"
+        f"{pe('pending2')} <b>Pending Submissions:</b> {_row_value(pending_task_subs, 'cnt')}\n"
+        f"{pe('trophy')} <b>Total Completions:</b> {_row_value(total_task_comp, 'cnt')}\n"
+        f"{pe('coins')} <b>Total Task Paid:</b> ₹{_row_value(total_task_paid, 't'):.2f}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=markup
     )
